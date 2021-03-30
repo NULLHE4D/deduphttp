@@ -5,6 +5,7 @@ import (
     "context"
     "time"
     "sync"
+    "os"
     "io"
     "io/ioutil"
     "net/http"
@@ -72,6 +73,7 @@ func HttpsRedirectFilter(hosts []string) []string {
 
     groupedHosts := GroupHosts(hosts)
     hostsChan := make(chan string)
+    var errHosts []string
     var hostsToFilter []string
     var wg sync.WaitGroup
     var m sync.Mutex
@@ -100,13 +102,15 @@ func HttpsRedirectFilter(hosts []string) []string {
     for i := 0; i < config.concurrency1; i++ {
 
         wg.Add(1)
-        go func(wg *sync.WaitGroup, m *sync.Mutex, hosts *[]string) {
+        go func(wg *sync.WaitGroup, m *sync.Mutex, hosts, errHosts *[]string, hostsChan <-chan string) {
 
             for u := range hostsChan {
 
                 req, err := http.NewRequest("GET", u, nil)
                 if err != nil {
-                    panic(err) // todo: don't panic
+                    fmt.Fprintf(os.Stderr, "%v: %v\n", u, err)
+                    *errHosts = append(*errHosts, u)
+                    continue
                 }
 
                 req.Header.Set("User-Agent", userAgent)
@@ -120,7 +124,9 @@ func HttpsRedirectFilter(hosts []string) []string {
                 }
 
                 if err != nil {
-                    panic(err) // todo: don't panic
+                    fmt.Fprintf(os.Stderr, "%v: %v\n", u, err)
+                    *errHosts = append(*errHosts, u)
+                    continue
                 }
 
                 // get redirection history
@@ -141,7 +147,7 @@ func HttpsRedirectFilter(hosts []string) []string {
 
             wg.Done()
 
-        }(&wg, &m, &hosts)
+        }(&wg, &m, &hosts, &errHosts, hostsChan)
 
     }
 
@@ -151,6 +157,10 @@ func HttpsRedirectFilter(hosts []string) []string {
 
     close(hostsChan)
     wg.Wait()
+
+    for _, v := range errHosts {
+        hosts = removeByValue(hosts, v)
+    }
 
     return hosts
 
@@ -173,7 +183,8 @@ func GenHostData(allocCtx context.Context, hd *HostData, dataOpts []bool) {
                 if err := chromedp.Run(ctx,
                     page.HandleJavaScriptDialog(true),
                 ); err != nil {
-                    panic(err)
+                    fmt.Fprintf(os.Stderr, "%v: %v\n", hd.host, err)
+                    return
                 }
             }()
         }
@@ -184,10 +195,11 @@ func GenHostData(allocCtx context.Context, hd *HostData, dataOpts []bool) {
         var jsOut string
         if err := chromedp.Run(ctx,
             chromedp.Navigate(hd.host),
-            chromedp.Sleep(time.Duration(config.delay) * time.Second), // todo: change duration
+            chromedp.Sleep(time.Duration(config.delay) * time.Second),
             chromedp.Evaluate("window.location.href;", &jsOut),
         ); err != nil {
-            panic(err)
+            fmt.Fprintf(os.Stderr, "%v: %v\n", hd.host, err)
+            return
         }
 
         hd.finalUrl = jsOut
@@ -234,7 +246,7 @@ func CommonHostRedirectFilter(hosts []string) []string {
     // with the same hostname as the finalPage URL
     filteredMap := make(map[string]string)
     for _, hd := range hdSlice {
-        if _, ok := filteredMap[hd.finalUrl]; !ok || getHostname(hd.finalUrl) == getHostname(hd.host) {
+        if _, ok := filteredMap[hd.finalUrl]; (!ok || getHostname(hd.finalUrl) == getHostname(hd.host)) && len(hd.finalUrl) > 0 {
             filteredMap[hd.finalUrl] = hd.host
         }
     }
